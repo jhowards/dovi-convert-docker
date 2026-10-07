@@ -5,6 +5,14 @@ A Docker container with a web interface for converting Dolby Vision Profile 7 MK
 ![Docker Pulls](https://img.shields.io/docker/pulls/smidley/dovi-convert)
 ![Docker Image Size](https://img.shields.io/docker/image-size/smidley/dovi-convert/latest)
 
+## Jellyfin 12 compatibility fork
+
+This fork uses Jellyfin's supported `Authorization: MediaBrowser Token="..."` header for connection tests, library discovery, scans, and metadata refresh. Jellyfin 12.1.0 rejects the legacy token headers used by the upstream image.
+
+Container image: `ghcr.io/jhowards/dovi-convert-docker:latest`. In Unraid, change the container's Repository to this image and apply, keeping the existing ports, media mounts, and /config mount. Your existing Jellyfin API key remains valid.
+
+Based on [smidley/dovi-convert-docker](https://github.com/smidley/dovi-convert-docker).
+
 ## Why Convert Profile 7 to 8.1?
 
 Dolby Vision Profile 7 files from UHD Blu-ray rips contain an Enhancement Layer (EL) that many media players cannot process, including:

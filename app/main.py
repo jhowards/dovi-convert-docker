@@ -32,6 +32,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dovi_convert")
 
+def jellyfin_headers(api_key: str) -> dict[str, str]:
+    """Use Jellyfin's supported authorization scheme, including Jellyfin 12."""
+    return {"Authorization": f'MediaBrowser Token="{api_key.strip()}"'}
+
 app = FastAPI(title="DoVi Convert", version="1.1.0")
 
 # Mount static files and templates
@@ -625,7 +629,7 @@ async def get_jellyfin_libraries():
     
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"X-Emby-Token": api_key}
+            headers = jellyfin_headers(api_key)
             async with session.get(f"{url}/Library/VirtualFolders", headers=headers) as resp:
                 if resp.status == 200:
                     libraries = await resp.json()
@@ -673,7 +677,7 @@ async def test_jellyfin():
     
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"X-Emby-Token": api_key}
+            headers = jellyfin_headers(api_key)
             async with session.get(f"{url}/System/Info", headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -850,7 +854,7 @@ async def refresh_jellyfin_item(filepath: str):
         await broadcast_message({"type": "output", "data": f"🔄 Refreshing Jellyfin metadata...\n"})
         
         filename = Path(filepath).name
-        headers = {"X-Emby-Token": api_key}
+        headers = jellyfin_headers(api_key)
         
         async with aiohttp.ClientSession() as session:
             # Search for the item by filename
@@ -939,7 +943,7 @@ async def run_jellyfin_scan():
     
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"X-Emby-Token": api_key}
+            headers = jellyfin_headers(api_key)
             
             include_movies = state.settings.get("include_movies", True)
             include_tv = state.settings.get("include_tv_shows", True)
