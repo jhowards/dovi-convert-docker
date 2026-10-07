@@ -70,6 +70,9 @@ class DoViConvertApp {
         // Controls
         this.scanPathInput = getEl('scanPath');
         this.scanDepthInput = getEl('scanDepth');
+        this.backupModeSelect = getEl('backupMode');
+        this.outputModeSelect = getEl('outputMode');
+        this.outputDirInput = getEl('outputDir');
         this.safeModeCheckbox = getEl('safeMode');
         this.useTempStorageCheckbox = getEl('useTempStorage');
         this.includeSimpleCheckbox = getEl('includeSimple');
@@ -151,6 +154,9 @@ class DoViConvertApp {
         
         // Settings changes
         addListener(this.scanDepthInput, 'change', () => this.saveSettings());
+        addListener(this.backupModeSelect, 'change', () => this.saveSettings());
+        addListener(this.outputModeSelect, 'change', () => this.saveSettings());
+        addListener(this.outputDirInput, 'change', () => this.saveSettings());
         addListener(this.safeModeCheckbox, 'change', () => this.saveSettings());
         addListener(this.useTempStorageCheckbox, 'change', () => this.saveSettings());
         addListener(this.includeSimpleCheckbox, 'change', () => this.saveSettings());
@@ -407,6 +413,11 @@ class DoViConvertApp {
     async startQueue() {
         if (this.conversionQueue.length === 0) return;
         
+        if (this.isRunning || this.inspectBusy) {
+            this.showPopup("Wait for the current operation to finish", "warning");
+            return;
+        }
+        if (!await this.saveSettings()) return;
         const paths = this.conversionQueue.map(f => f.path);
         
         try {
@@ -420,8 +431,12 @@ class DoViConvertApp {
                 this.appendToTerminal(`📦 Starting conversion of ${paths.length} files...\n`, 'system');
                 this.switchControlTab('actions');
                 this.switchTab('output');
+            } else {
+                const result = await response.json();
+                throw new Error(result.detail || result.error || response.statusText);
             }
         } catch (error) {
+            this.showPopup(`Failed to start queue: ${error.message}`, 'error');
             this.appendToTerminal(`❌ Failed to start queue: ${error.message}\n`, 'error');
         }
     }
@@ -560,42 +575,64 @@ class DoViConvertApp {
         try {
             const response = await fetch('/api/backups');
             const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Failed to load backups');
             
             if (data.backups && data.backups.length > 0) {
-                this.backupList.innerHTML = data.backups.map(backup => {
-                    const size = this.formatSize(backup.size);
-                    const date = new Date(backup.modified * 1000).toLocaleDateString();
-                    const dirParts = backup.directory.split('/');
-                    const shortDir = dirParts.slice(-2).join('/');
-                    
-                    return `
-                        <div class="backup-item" data-path="${backup.backup_path}">
-                            <div class="backup-item-info">
-                                <div class="backup-item-name" title="${backup.original_name}">${backup.original_name}</div>
-                                <div class="backup-item-details">${size} • ${date} ${backup.converted_exists ? '• Converted version exists' : ''}</div>
-                                <div class="backup-item-path" title="${backup.directory}">📁 ${shortDir}</div>
-                            </div>
-                            <div class="backup-item-actions">
-                                <button class="btn btn-small btn-restore" onclick="app.restoreBackup('${backup.backup_path.replace(/'/g, "\\'")}', '${backup.original_name.replace(/'/g, "\\'")}')">
-                                    ↩️ Restore
-                                </button>
-                                <button class="btn btn-small btn-delete-single" onclick="app.deleteBackup('${backup.backup_path.replace(/'/g, "\\'")}', '${backup.original_name.replace(/'/g, "\\'")}')">
-                                    🗑️
-                                </button>
-                            </div>
-                        </div>
-                    `;
-                }).join('');
+                this.backupList.replaceChildren();
+                data.backups.forEach(backup => {
+                    const compact = backup.backup_type === 'compact';
+                    const item = document.createElement('div');
+                    item.className = 'backup-item';
+                    const info = document.createElement('div');
+                    info.className = 'backup-item-info';
+                    const name = document.createElement('div');
+                    name.className = 'backup-item-name';
+                    name.textContent = backup.original_name;
+                    name.title = backup.original_name;
+                    const details = document.createElement('div');
+                    details.className = 'backup-item-details';
+                    details.textContent = `${compact ? 'Compact archive' : 'Full original backup'} • ${this.formatSize(backup.size)} • ${new Date(backup.modified * 1000).toLocaleDateString()}`;
+                    const path = document.createElement('div');
+                    path.className = 'backup-item-path';
+                    path.textContent = backup.directory;
+                    path.title = backup.directory;
+                    info.append(name, details, path);
+                    const actions = document.createElement('div');
+                    actions.className = 'backup-item-actions';
+                    const restore = document.createElement('button');
+                    restore.className = 'btn btn-small btn-restore';
+                    restore.textContent = compact ? '↩️ Reconstruct' : '↩️ Restore';
+                    restore.disabled = backup.can_restore === false || this.isRunning || !!this.inspectBusy;
+                    restore.title = backup.can_restore === false
+                        ? 'Restore unavailable: matching converted file is required and the restored destination must be clear'
+                        : compact ? 'Create a separate .restored.mkv; keep converted file and archive' : 'Restore original file in place';
+                    restore.addEventListener('click', () => this.restoreBackup(backup.backup_path, backup.original_name, backup.backup_type));
+                    const remove = document.createElement('button');
+                    remove.className = 'btn btn-small btn-delete-single';
+                    remove.textContent = '🗑️';
+                    remove.title = 'Delete backup';
+                    remove.addEventListener('click', () => this.deleteBackup(backup.backup_path, backup.original_name));
+                    actions.append(restore, remove);
+                    item.append(info, actions);
+                    this.backupList.appendChild(item);
+                });
             } else {
                 this.backupList.innerHTML = '<div class="no-backups">No backup files found.</div>';
             }
         } catch (error) {
-            this.backupList.innerHTML = `<div class="no-backups">Error loading backups: ${error.message}</div>`;
+            this.backupList.textContent = `Error loading backups: ${error.message}`;
         }
     }
     
-    async restoreBackup(backupPath, originalName) {
-        if (!confirm(`Restore "${originalName}"? This will replace the converted file with the original Profile 7 version.`)) return;
+    async restoreBackup(backupPath, originalName, backupType = 'full') {
+        if (this.isRunning || this.inspectBusy) {
+            this.showPopup('Wait for the current operation to finish', 'warning');
+            return;
+        }
+        const message = backupType === 'compact'
+            ? `Reconstruct "${originalName}" as a separate .restored.mkv? The converted file and compact archive will both be kept.`
+            : `Restore "${originalName}"? This will replace the converted file with the original version.`;
+        if (!confirm(message)) return;
         
         try {
             const response = await fetch('/api/backups/restore', {
@@ -604,16 +641,16 @@ class DoViConvertApp {
                 body: JSON.stringify({ backup_path: backupPath })
             });
             
-            if (response.ok) {
-                const result = await response.json();
-                this.showPopup(`Restored: ${result.restored}`, 'success');
-                this.appendToTerminal(`🔄 Restored backup: ${result.restored}\n`, 'system');
+            const result = await response.json();
+            if (response.ok && result.success !== false) {
+                const restoredPath = result.restored_path || result.restored;
+                this.showPopup(`Restored: ${restoredPath}`, 'success');
+                this.appendToTerminal(`🔄 Restored backup: ${restoredPath}\n`, 'system');
                 await this.loadBackupsList();
                 this.loadStats();
                 this.loadCachedResults();
             } else {
-                const error = await response.json();
-                this.showPopup(`Failed to restore: ${error.detail}`, 'error');
+                this.showPopup(`Failed to restore: ${result.detail || result.error || 'Restore failed'}`, 'error');
             }
         } catch (error) {
             this.showPopup(`Error: ${error.message}`, 'error');
@@ -854,7 +891,11 @@ class DoViConvertApp {
                 if (data.settings) this.applySettings(data.settings);
                 break;
             case 'output':
-                this.appendToTerminal(data.data);
+                if (this.inspectBusy) {
+                    this.inspectStreamOutput += data.data;
+                } else {
+                    this.appendToTerminal(data.data);
+                }
                 break;
             case 'log_marker':
                 this.addLogMarker(data.data.id, data.data.filename);
@@ -1183,6 +1224,12 @@ class DoViConvertApp {
                     <span class="badge ${badgeClass}">${badgeText}</span>
             </div>
         `;
+            const inspectButton = document.createElement('button');
+            inspectButton.className = 'btn btn-small btn-secondary inspect-button';
+            inspectButton.textContent = this.inspectBusy ? 'Inspecting…' : 'Inspect';
+            inspectButton.disabled = this.isRunning || !!this.inspectBusy || !file.path;
+            inspectButton.addEventListener('click', () => this.inspectFile(file.path));
+            item.querySelector('.file-action').appendChild(inspectButton);
             list.appendChild(item);
         });
         
@@ -1222,10 +1269,13 @@ class DoViConvertApp {
 
     updateStatus(running, action = '') {
         this.isRunning = running;
+        document.querySelectorAll('.inspect-button').forEach(button => {
+            button.disabled = running || !!this.inspectBusy;
+        });
         
         if (running) {
             this.statusIndicator?.classList.add('running');
-            if (this.statusText) this.statusText.textContent = action === 'scan' ? 'Scanning...' : 'Converting...';
+            if (this.statusText) this.statusText.textContent = action === 'scan' ? 'Scanning...' : action === 'inspect' ? 'Inspecting...' : action === 'restore' ? 'Restoring...' : 'Converting...';
             if (this.scanBtn) {
                 this.scanBtn.disabled = true;
                 this.scanBtn.classList.add('loading');
@@ -1322,6 +1372,9 @@ class DoViConvertApp {
         if (settings.scan_depth !== undefined && this.scanDepthInput) {
             this.scanDepthInput.value = settings.scan_depth;
         }
+        if (this.backupModeSelect) this.backupModeSelect.value = settings.backup_mode || 'full';
+        if (this.outputModeSelect) this.outputModeSelect.value = settings.output_mode || 'dv';
+        if (this.outputDirInput) this.outputDirInput.value = settings.output_dir || '';
         if (this.safeModeCheckbox) this.safeModeCheckbox.checked = settings.safe_mode ?? false;
         if (this.useTempStorageCheckbox) this.useTempStorageCheckbox.checked = settings.use_temp_storage ?? false;
         if (this.includeSimpleCheckbox) this.includeSimpleCheckbox.checked = settings.include_simple_fel ?? false;
@@ -1353,6 +1406,9 @@ class DoViConvertApp {
         const settings = {
             scan_path: this.scanPathInput?.value,
             scan_depth: parseInt(this.scanDepthInput?.value, 10) || 5,
+            backup_mode: this.backupModeSelect?.value || 'full',
+            output_mode: this.outputModeSelect?.value || 'dv',
+            output_dir: this.outputDirInput?.value.trim() || '',
             safe_mode: this.safeModeCheckbox?.checked ?? false,
             use_temp_storage: this.useTempStorageCheckbox?.checked ?? false,
             include_simple_fel: this.includeSimpleCheckbox?.checked ?? false,
@@ -1369,13 +1425,19 @@ class DoViConvertApp {
         };
         
         try {
-            await fetch('/api/settings', {
+            const response = await fetch('/api/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(settings)
             });
+            const result = await response.json();
+            if (!response.ok || result.success === false) {
+                throw new Error(result.detail || result.error || 'Settings were not saved');
+            }
+            return true;
         } catch (error) {
-            console.error('Failed to save settings:', error);
+            this.showPopup(`Failed to save settings: ${error.message}`, 'error');
+            return false;
         }
     }
     
@@ -1549,6 +1611,43 @@ class DoViConvertApp {
         }
     }
     
+    async inspectFile(filepath) {
+        if (this.isRunning || this.inspectBusy) {
+            this.showPopup('Wait for the current operation to finish', 'warning');
+            return;
+        }
+        this.inspectBusy = true;
+        this.inspectStreamOutput = '';
+        let reportDisplayed = false;
+        this.renderResultsPage();
+        this.switchTab('output');
+        this.appendToTerminal(`\n🔍 Inspecting: ${filepath}\n`, 'system');
+        try {
+            const response = await fetch('/api/inspect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filepath })
+            });
+            const result = await response.json();
+            if (result.output) {
+                this.appendToTerminal(result.output + '\n');
+                reportDisplayed = true;
+            }
+            if (!response.ok || result.success === false) {
+                throw new Error(result.detail || result.error || 'Inspection failed');
+            }
+        } catch (error) {
+            this.showPopup(`Inspection failed: ${error.message}`, 'error');
+            this.appendToTerminal(`❌ Inspection failed: ${error.message}\n`, 'error');
+        } finally {
+            if (!reportDisplayed && this.inspectStreamOutput) {
+                this.appendToTerminal(this.inspectStreamOutput + '\n');
+            }
+            this.inspectBusy = false;
+            this.renderResultsPage();
+        }
+    }
+
     async stopProcess() {
         try {
             await fetch('/api/stop', { method: 'POST' });

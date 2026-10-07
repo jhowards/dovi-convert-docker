@@ -2036,3 +2036,30 @@ body::before {
         flex-wrap: wrap;
     }
 }
+
+/* Conversion destinations and per-file inspection */
+.conversion-field {
+    flex-direction: column;
+    align-items: stretch;
+    margin-bottom: var(--space-md);
+}
+
+.conversion-field select,
+.conversion-field input {
+    width: 100%;
+    min-width: 0;
+    padding: var(--space-sm);
+    background: var(--surface-1);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.8125rem;
+}
+
+.result-item .file-action {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--space-sm);
+}
