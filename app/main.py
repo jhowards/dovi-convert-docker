@@ -14,7 +14,7 @@ import logging
 import sys
 import aiohttp
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -573,14 +573,10 @@ async def restore_backup(request: RestoreRequest):
     original_path = os.path.join(os.path.dirname(backup_path), original_name)
     
     try:
-        # If converted file exists, remove it first
-        if os.path.exists(original_path):
-            logger.info(f"Removing converted file: {original_path}")
-            os.remove(original_path)
-        
-        # Rename backup to original
+        # Both files share a directory: replace atomically, preserving the current
+        # converted file if the filesystem cannot complete the restoration.
         logger.info(f"Restoring backup: {backup_path} -> {original_path}")
-        os.rename(backup_path, original_path)
+        os.replace(backup_path, original_path)
         
         # Update cache - mark as profile7 again
         if original_path in state.scan_cache.get("files", {}):
@@ -853,7 +849,6 @@ async def start_scan(request: ScanRequest = ScanRequest()):
     if state.is_running:
         raise HTTPException(status_code=409, detail="A process is already running")
     
-    state.is_running = True
     state.scan_cancelled = False
     state.is_running = True
     state.current_action = "scan"
@@ -864,7 +859,6 @@ async def start_scan(request: ScanRequest = ScanRequest()):
         jellyfin_key = state.settings.get("jellyfin_api_key", "")
         
         if not jellyfin_url or not jellyfin_key:
-            state.is_running = False
             await broadcast_message({"type": "output", "data": "❌ Jellyfin URL and API key are required\n"})
             state.is_running = False
             state.current_action = None
@@ -883,7 +877,6 @@ async def start_convert(request: ConvertRequest = ConvertRequest()):
     if state.is_running:
         raise HTTPException(status_code=409, detail="A process is already running")
     
-    state.is_running = True
     state.scan_cancelled = False
     state.is_running = True
     state.current_action = "convert"
@@ -2729,56 +2722,72 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
 
 
 def setup_scheduled_scan():
-    """Setup or cancel scheduled scans based on settings."""
-    # Cancel existing task if any
-    if state.scheduled_task:
-        state.scheduled_task.cancel()
-        state.scheduled_task = None
-    
-    if state.settings.get("schedule_enabled"):
+    """Start scheduling without interrupting an already-started job on settings saves."""
+    if state.settings.get("schedule_enabled") and (
+        state.scheduled_task is None or state.scheduled_task.done()
+    ):
         state.scheduled_task = asyncio.create_task(run_scheduler())
 
 
+def scheduled_occurrence(now: datetime, schedule_time: str, schedule_days: list):
+    """Return the due occurrence, using the UI's Sunday=0 day numbering."""
+    hour, minute = map(int, schedule_time.split(":"))
+    for day in (now, now - timedelta(days=1)):
+        target = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target.isoweekday() % 7 in schedule_days and target <= now < target + timedelta(minutes=5):
+            return target.isoformat()
+    return None
+
+
 async def run_scheduler():
-    """Background scheduler for automated scans."""
-    while True:
+    """Run once per occurrence, including across settings saves and restarts."""
+    marker = Path(CONFIG_PATH) / "scheduler.json"
+    try:
+        record = json.loads(marker.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("Scheduler record must be an object")
+        last_occurrence = record.get("last_occurrence")
+    except FileNotFoundError:
+        last_occurrence = None
+    except (OSError, ValueError) as exc:
+        logger.error(f"Cannot read scheduler run record; scheduling stopped: {exc}")
+        return
+    while state.settings.get("schedule_enabled"):
         try:
             schedule_time = state.settings.get("schedule_time", "02:00")
             schedule_days = state.settings.get("schedule_days", [6])
-            
-            now = datetime.now()
-            target_hour, target_minute = map(int, schedule_time.split(":"))
-            
-            # Check if we should run today
-            if now.weekday() in schedule_days:
-                target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-                
-                if now >= target and now < target.replace(minute=target_minute + 5):
-                    # Time to scan!
-                    if not state.is_running:
-                        await broadcast_message({"type": "output", "data": "\n⏰ Scheduled scan starting...\n"})
-                        
-                        if state.settings.get("use_jellyfin"):
-                            await run_jellyfin_scan()
-                        else:
-                            await run_scan(incremental=True)
-                        
-                        # Auto convert if enabled
-                        if state.settings.get("auto_convert"):
-                            profile7_count = sum(1 for f in state.scan_cache.get("files", {}).values() if f.get("profile") == "profile7")
-                            if profile7_count > 0:
-                                await broadcast_message({"type": "output", "data": f"\n🔄 Auto-converting {profile7_count} Profile 7 files...\n"})
-                                await run_convert()
-            
-            # Sleep for 1 minute
+            occurrence = scheduled_occurrence(datetime.now(), schedule_time, schedule_days)
+            if occurrence and occurrence != last_occurrence and not state.is_running:
+                # Record before starting, so a short job or restart cannot repeat it.
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                pending = marker.with_suffix(".tmp")
+                pending.write_text(json.dumps({"last_occurrence": occurrence}))
+                os.replace(pending, marker)
+                last_occurrence = occurrence
+                state.is_running = True
+                state.current_action = "scan"
+                await broadcast_message({"type": "output", "data": "\n⏰ Scheduled scan starting...\n"})
+
+                # Scan/conversion handlers release their own running state on completion.
+                if state.settings.get("use_jellyfin"):
+                    await run_jellyfin_scan()
+                else:
+                    await run_scan(incremental=True)
+
+                if state.settings.get("auto_convert") and not state.is_running:
+                    profile7_count = sum(1 for f in state.scan_cache.get("files", {}).values() if f.get("profile") == "profile7")
+                    if profile7_count > 0:
+                        state.is_running = True
+                        state.current_action = "convert"
+                        await broadcast_message({"type": "output", "data": f"\n🔄 Auto-converting {profile7_count} Profile 7 files...\n"})
+                        await run_convert()
+
             await asyncio.sleep(60)
-            
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            print(f"Scheduler error: {e}")
+        except Exception as exc:
+            logger.error(f"Scheduler error: {exc}")
             await asyncio.sleep(60)
-
 
 def cleanup_temp_storage():
     """Clean up any orphaned files in temp storage from previous runs."""

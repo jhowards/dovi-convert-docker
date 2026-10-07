@@ -8,6 +8,8 @@ The fork bundles stable **dovi_convert 8.2.0** and uses its v8 command syntax. T
 
 Temp Storage uses the engine's native `--temp /temp_storage` option without copying the entire movie to the SSD and back. Mount the directory before enabling it. Removing full backups applies only to each successfully verified conversion; compact archives remain available for restoration. Bulk backup cleanup removes full originals only. Conversion settings are captured when a job starts, and skipped files are reported separately from failures.
 
+Full-original restores use an atomic replacement. Scheduled scans run once per scheduled occurrence, including across container restarts, and handle hour/midnight boundaries and the days selected in the UI. Saving settings does not interrupt an already-started scheduled job. Disabling the schedule prevents subsequent jobs.
+
 This fork uses Jellyfin's supported `Authorization: MediaBrowser Token="..."` header for connection tests, library discovery, scans, and metadata refresh. Jellyfin 12.1.0 rejects the legacy token headers used by the upstream image.
 
 Container image: `ghcr.io/jhowards/dovi-convert-docker:latest`. In Unraid, change the container's Repository to this image and apply, keeping the existing ports, media mounts, and /config mount. Your existing Jellyfin API key remains valid.
