@@ -22,6 +22,7 @@ from fastapi.requests import Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import subprocess
+from contextlib import asynccontextmanager
 
 # Configure logging to output to container logs (stdout)
 logging.basicConfig(
@@ -36,7 +37,18 @@ def jellyfin_headers(api_key: str) -> dict[str, str]:
     """Use Jellyfin's supported authorization scheme, including Jellyfin 12."""
     return {"Authorization": f'MediaBrowser Token="{api_key.strip()}"'}
 
-app = FastAPI(title="DoVi Convert", version="1.1.0")
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        if state.scheduled_task:
+            state.scheduled_task.cancel()
+            await state.scheduled_task
+
+
+app = FastAPI(title="DoVi Convert", version="1.2.0", lifespan=app_lifespan)
 
 # Mount static files and templates
 app.mount("/static", StaticFiles(directory="/app/static"), name="static")
@@ -183,8 +195,7 @@ class ScanRequest(BaseModel):
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request,
+    return templates.TemplateResponse(request=request, name="index.html", context={
         "media_path": MEDIA_PATH
     })
 
@@ -2759,7 +2770,6 @@ def cleanup_temp_storage():
         logger.warning(f"Error during temp storage cleanup: {e}")
 
 
-@app.on_event("startup")
 async def startup_event():
     """Initialize scheduler on startup."""
     logger.info("="*50)
