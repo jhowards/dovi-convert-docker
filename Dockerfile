@@ -1,7 +1,7 @@
 # DoVi Convert Docker Image
 # Converts Dolby Vision Profile 7 to Profile 8.1 with a web interface
 
-FROM python:3.12-slim-bookworm AS base
+FROM python:3.12-slim-trixie AS base
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dovi_tool from GitHub releases
-ARG DOVI_TOOL_VERSION=2.1.2
+ARG DOVI_TOOL_VERSION=2.3.4
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
         amd64) DOVI_ARCH="x86_64-unknown-linux-musl" ;; \
@@ -81,4 +81,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/ || exit 1
 
 # Run the application
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--ws", "websockets-sansio"]

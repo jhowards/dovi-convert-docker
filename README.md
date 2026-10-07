@@ -2,16 +2,15 @@
 
 A Docker container with a web interface for converting Dolby Vision Profile 7 MKV files (UHD Blu-ray rips) to Profile 8.1. Based on the excellent [dovi_convert](https://github.com/cryptochrome/dovi_convert) script by cryptochrome.
 
-![Docker Pulls](https://img.shields.io/docker/pulls/smidley/dovi-convert)
-![Docker Image Size](https://img.shields.io/docker/image-size/smidley/dovi-convert/latest)
-
-## Jellyfin 12 compatibility fork
+## Updated conversion stack
 
 The fork now bundles stable **dovi_convert 8.2.0** and uses its v8 command syntax for scans, individual conversions, directory conversions, and cleanup. Scan classification reads the file's Status line, and existing full-file `.mkv.bak.dovi_convert` backups remain supported. The v8 enhancement-layer archive feature is available through the CLI; the web UI continues to use full-file backups.
 
 This fork uses Jellyfin's supported `Authorization: MediaBrowser Token="..."` header for connection tests, library discovery, scans, and metadata refresh. Jellyfin 12.1.0 rejects the legacy token headers used by the upstream image.
 
 Container image: `ghcr.io/jhowards/dovi-convert-docker:latest`. In Unraid, change the container's Repository to this image and apply, keeping the existing ports, media mounts, and /config mount. Your existing Jellyfin API key remains valid.
+
+The image uses **dovi_tool 2.3.4**, **Python 3.12 on Debian Trixie**, and Debian's packaged FFmpeg, MKVToolNix, and MediaInfo. Python dependencies are pinned in `requirements.txt`: FastAPI 0.142.2, Starlette 1.7.0, Uvicorn 0.54.0, Jinja2 3.1.6, python-multipart 0.0.32, websockets 17.2, Pydantic 2.13.5, and aiohttp 3.14.4. Uvicorn uses its `websockets-sansio` backend. Distribution multimedia packages receive the versions available in Trixie when the image is built.
 
 Based on [smidley/dovi-convert-docker](https://github.com/smidley/dovi-convert-docker).
 
@@ -46,17 +45,15 @@ docker run -d \
   -v /path/to/media:/media \
   -v /path/to/config:/config \
   -e TZ=America/New_York \
-  smidley/dovi-convert:latest
+  ghcr.io/jhowards/dovi-convert-docker:latest
 ```
 
 ### Docker Compose
 
 ```yaml
-version: '3.8'
-
 services:
   dovi-convert:
-    image: smidley/dovi-convert:latest
+    image: ghcr.io/jhowards/dovi-convert-docker:latest
     container_name: dovi-convert
     ports:
       - "8080:8080"
@@ -70,10 +67,9 @@ services:
 
 ### Unraid
 
-1. Go to the **Apps** tab in Unraid
-2. Search for **dovi-convert**
-3. Click **Install**
-4. Configure your media path and click **Apply**
+1. Install the upstream **dovi-convert** template from the **Apps** tab, or edit your existing container.
+2. Set **Repository** to `ghcr.io/jhowards/dovi-convert-docker:latest`.
+3. Configure the media and persistent `/config` mounts, preserve existing port mappings, and click **Apply**.
 
 ## Usage
 
@@ -130,7 +126,7 @@ Original files are preserved as `*.bak.dovi_convert`. Enable **Auto Cleanup** on
 ## Building Locally
 
 ```bash
-git clone https://github.com/smidley/dovi-convert-docker.git
+git clone https://github.com/jhowards/dovi-convert-docker.git
 cd dovi-convert-docker
 docker build -t dovi-convert .
 ```
@@ -153,5 +149,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/smidley/dovi-convert-docker/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/smidley/dovi-convert-docker/discussions)
+- **Issues**: [GitHub Issues](https://github.com/jhowards/dovi-convert-docker/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/jhowards/dovi-convert-docker/discussions)
