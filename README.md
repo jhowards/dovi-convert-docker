@@ -4,7 +4,9 @@ A Docker container with a web interface for converting Dolby Vision Profile 7 MK
 
 ## Updated conversion stack
 
-The fork now bundles stable **dovi_convert 8.2.0** and uses its v8 command syntax for scans, individual conversions, directory conversions, and cleanup. Scan classification reads the file's Status line, and existing full-file `.mkv.bak.dovi_convert` backups remain supported. The v8 enhancement-layer archive feature is available through the CLI; the web UI continues to use full-file backups.
+The fork bundles stable **dovi_convert 8.2.0** and uses its v8 command syntax. The web UI supports full original backups or compact `.dovi` enhancement-layer archives, Dolby Vision 8.1 or HDR10 output, an optional output directory, and per-file full Inspect reports. Compact restore creates a separate `.restored.mkv` and retains the converted file and archive. Existing full-file `.mkv.bak.dovi_convert` backups remain supported.
+
+Temp Storage uses the engine's native `--temp /temp_storage` option without copying the entire movie to the SSD and back. Mount the directory before enabling it. Removing full backups applies only to each successfully verified conversion; compact archives remain available for restoration. Bulk backup cleanup removes full originals only. Conversion settings are captured when a job starts, and skipped files are reported separately from failures.
 
 This fork uses Jellyfin's supported `Authorization: MediaBrowser Token="..."` header for connection tests, library discovery, scans, and metadata refresh. Jellyfin 12.1.0 rejects the legacy token headers used by the upstream image.
 

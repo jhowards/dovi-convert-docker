@@ -855,6 +855,7 @@ async def start_scan(request: ScanRequest = ScanRequest()):
     
     state.is_running = True
     state.scan_cancelled = False
+    state.is_running = True
     state.current_action = "scan"
     await broadcast_message({"type": "status", "running": True, "action": "scan"})
     
@@ -863,6 +864,7 @@ async def start_scan(request: ScanRequest = ScanRequest()):
         jellyfin_key = state.settings.get("jellyfin_api_key", "")
         
         if not jellyfin_url or not jellyfin_key:
+            state.is_running = False
             await broadcast_message({"type": "output", "data": "❌ Jellyfin URL and API key are required\n"})
             state.is_running = False
             state.current_action = None
@@ -883,6 +885,7 @@ async def start_convert(request: ConvertRequest = ConvertRequest()):
     
     state.is_running = True
     state.scan_cancelled = False
+    state.is_running = True
     state.current_action = "convert"
     await broadcast_message({"type": "status", "running": True, "action": "convert"})
     asyncio.create_task(run_convert(files=request.files))
@@ -2477,7 +2480,7 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         step_patterns = [
             (r"Extracting|Extract", "Extracting video stream"),
             (r"Analyzing|Analyz", "Analyzing Dolby Vision"),
-            (r"Converting|Convert", "Converting to HDR10" if state.settings.get("output_mode") == "hdr10" else "Converting to Profile 8.1"),
+            (r"Converting|Convert", "Converting to HDR10" if "--hdr10" in cmd else "Converting to Profile 8.1"),
             (r"Remux|Muxing|mux", "Remuxing to MKV"),
             (r"Cleanup|Clean", "Cleaning up temp files"),
             (r"Verif", "Verifying output"),
@@ -2513,6 +2516,7 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
             
             text = ANSI_ESCAPE_RE.sub("", text)
             output_lines.append(text)
+            previous_percent = file_percent
             await broadcast_message({"type": "output", "data": text})
             
             # Check for error indicators in output
@@ -2526,6 +2530,8 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
             # Verification occurs before final file placement; only finalization proves conversion.
             if re.search(r'Original Source (saved as:|deleted \(\-\-delete active\))', text):
                 saw_success = True
+                # A successful native fallback may have reported an earlier error.
+                saw_error = False
             
             # Parse elapsed time from script output like "(1m 44s)" or "(5s)"
             time_match = re.search(r'\((\d+)m\s*(\d+)s\)', text)
@@ -2545,8 +2551,8 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
                     total_steps = total_steps_parsed
                     # Calculate progress based on step and elapsed time
                     # Step weight: Extract ~70%, Convert ~20%, Remux ~10%
-                    step_weights = [0.70, 0.20, 0.10]  # Cumulative: 0, 70, 90, 100
-                    step_starts = [0, 70, 90]
+                    step_weights = [0.70, 0.20, 0.10] if total_steps == 3 else [1 / total_steps] * total_steps
+                    step_starts = [sum(step_weights[:n]) * 100 for n in range(total_steps)]
                     
                     if current_step_num <= len(step_weights):
                         base_percent = step_starts[current_step_num - 1] if current_step_num > 0 else 0
@@ -2574,8 +2580,8 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
                     explicit_percent = int(float(percent_match.group(1)))
                     # If we have step info, add percentage within step
                     if current_step_num > 0:
-                        step_weights = [0.70, 0.20, 0.10]
-                        step_starts = [0, 70, 90]
+                        step_weights = [0.70, 0.20, 0.10] if total_steps == 3 else [1 / total_steps] * total_steps
+                        step_starts = [sum(step_weights[:n]) * 100 for n in range(total_steps)]
                         base_percent = step_starts[current_step_num - 1] if current_step_num <= len(step_starts) else 90
                         step_weight = step_weights[current_step_num - 1] if current_step_num <= len(step_weights) else 0.10
                         file_percent = int(base_percent + (explicit_percent / 100 * step_weight * 100))
@@ -2584,6 +2590,8 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
                 except:
                     pass
             
+            # Reserve 100% for verified final placement, including four-step Safe Mode.
+            file_percent = min(99, max(previous_percent, file_percent))
             # Send progress update (throttle to avoid flooding)
             current_time = asyncio.get_event_loop().time()
             if current_time - last_progress_update >= 0.5:  # Update every 500ms max

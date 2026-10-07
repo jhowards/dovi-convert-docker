@@ -60,6 +60,9 @@ COPY static/ ./static/
 # Create directories for config and media
 RUN mkdir -p /config /media
 
+# Verify syntax and framework compatibility while building both architectures.
+RUN python -m compileall -q app && python -c "from app.main import app"
+
 # Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV MEDIA_PATH=/media
