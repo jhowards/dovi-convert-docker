@@ -1316,7 +1316,7 @@ def detect_fel_from_mediainfo(hdr_info: str) -> str:
 
 async def detect_fel_type_deep(filepath: str) -> str:
     """
-    Deep FEL detection using dovi_convert script's -scan feature.
+    Deep FEL detection using dovi_convert's scan command.
     This leverages the upstream script's proven detection logic.
     
     Returns: 'MEL' (safe), 'FEL' (complex, quality loss), 'SimpleFEL' (likely safe), or 'unknown'
@@ -1324,13 +1324,12 @@ async def detect_fel_type_deep(filepath: str) -> str:
     Reference: https://github.com/cryptochrome/dovi_convert
     """
     filename = Path(filepath).name
-    logger.info(f"[Deep Scan] Using dovi_convert -scan for: {filename}")
+    logger.info(f"[Deep Scan] Using dovi_convert scan for: {filename}")
     
     try:
-        # Use the dovi_convert script's -scan feature
-        # It outputs colored text with verdicts: MEL (green), Simple FEL (cyan), Complex FEL (red)
+        # v8 reports MEL, FEL (Simple), or FEL (Complex) on the Status line.
         proc = await asyncio.create_subprocess_exec(
-            "dovi_convert", "-scan", filepath,
+            "dovi_convert", "scan", filepath,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "NO_COLOR": "1"}  # Disable colors for easier parsing
@@ -1339,7 +1338,7 @@ async def detect_fel_type_deep(filepath: str) -> str:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
         except asyncio.TimeoutError:
-            logger.warning(f"[Deep Scan] dovi_convert -scan timed out for {filename}")
+            logger.warning(f"[Deep Scan] dovi_convert scan timed out for {filename}")
             proc.kill()
             await proc.wait()
             return "unknown"
@@ -1347,22 +1346,32 @@ async def detect_fel_type_deep(filepath: str) -> str:
         output = stdout.decode() + stderr.decode()
         logger.info(f"[Deep Scan] dovi_convert output for {filename}:\n{output}")
         
-        # Normalize output for parsing - handle various formats
-        output_normalized = output.lower().replace("-", " ").replace("_", " ")
+        if proc.returncode != 0:
+            logger.warning(f"[Deep Scan] Scan failed for {filename}: exit {proc.returncode}")
+            return "unknown"
+
+        # v8 reports the verdict on its Status line. Advisory paragraphs can
+        # mention other FEL types, so only classify this file's actual status.
+        clean_output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output)
+        status = re.search(r'^Status:\s*(.+)$', clean_output, re.MULTILINE)
+        if not status:
+            logger.warning(f"[Deep Scan] No status reported for {filename}")
+            return "unknown"
+        output_normalized = status.group(1).lower().replace("-", " ").replace("_", " ")
         
-        # Parse the dovi_convert -scan output for verdicts
+        # Parse the dovi_convert scan status for verdicts
         # The script has 3 verdicts:
         # - MEL (safe to convert)
         # - Simple-FEL / Simple FEL (likely safe to convert)  
         # - Complex-FEL / Complex FEL (NOT safe, will lose quality)
         
         # Check for Complex FEL first (most restrictive)
-        if "complex fel" in output_normalized or "complexfel" in output_normalized:
+        if "fel (complex)" in output_normalized:
             logger.info(f"[Deep Scan] Result for {filename}: ComplexFEL (quality loss if converted)")
             return "ComplexFEL"
         
         # Check for Simple FEL (likely safe)
-        elif "simple fel" in output_normalized or "simplefel" in output_normalized:
+        elif "fel (simple)" in output_normalized:
             logger.info(f"[Deep Scan] Result for {filename}: SimpleFEL (likely safe)")
             return "SimpleFEL"
         
@@ -1377,7 +1386,7 @@ async def detect_fel_type_deep(filepath: str) -> str:
             return "Profile8"
         
         # Check for non-DV content
-        elif "not a dolby vision" in output_normalized or "no dolby vision" in output_normalized or "not dolby vision" in output_normalized:
+        elif output_normalized in {"hdr10", "hdr10+", "hlg", "sdr"}:
             logger.info(f"[Deep Scan] Result for {filename}: Not DV")
             return "NotDV"
         
@@ -2182,12 +2191,12 @@ async def run_convert(files: List[str] = None):
                     convert_filepath = temp_file
                     await broadcast_message({"type": "output", "data": f"✅ Copied to temp storage\n\n"})
                 
-                cmd = ["/usr/local/bin/dovi_convert", "-convert", convert_filepath]
+                cmd = ["/usr/local/bin/dovi_convert", "convert", convert_filepath]
                 if safe_mode:
-                    cmd.append("-safe")
+                    cmd.append("--safe")
                 if include_simple:
-                    cmd.append("-include-simple")
-                cmd.append("-y")
+                    cmd.append("--include-simple")
+                cmd.append("--yes")
                 
                 # Run command and track result
                 success = await run_convert_command(cmd, cwd=str(Path(convert_filepath).parent), 
@@ -2309,11 +2318,11 @@ async def run_convert(files: List[str] = None):
             # Batch conversion
             await broadcast_message({"type": "output", "data": f"🎬 Starting batch conversion in: {scan_path}\n"})
             
-            cmd = ["/usr/local/bin/dovi_convert", "-batch", str(state.settings.get("scan_depth", 5)), "-y"]
+            cmd = ["/usr/local/bin/dovi_convert", "convert", ".", "--recursive", str(state.settings.get("scan_depth", 5)), "--yes"]
             if safe_mode:
-                cmd.append("-safe")
+                cmd.append("--safe")
             if include_simple:
-                cmd.append("-include-simple")
+                cmd.append("--include-simple")
             
             await broadcast_message({"type": "output", "data": f"Running: {' '.join(cmd)}\n\n"})
             await run_command(cmd, cwd=scan_path)
@@ -2321,7 +2330,7 @@ async def run_convert(files: List[str] = None):
         # Auto cleanup if enabled
         if state.settings.get("auto_cleanup", False):
             await broadcast_message({"type": "output", "data": "\n🧹 Running cleanup...\n"})
-            cleanup_cmd = ["/usr/local/bin/dovi_convert", "-cleanup", "-r"]
+            cleanup_cmd = ["/usr/local/bin/dovi_convert", "cleanup", "--recursive", "--yes"]
             await run_command(cleanup_cmd, cwd=scan_path)
             
     except Exception as e:
@@ -2342,7 +2351,7 @@ async def run_command(cmd: list, cwd: str = None):
         if main_cmd.startswith('/') and not Path(main_cmd).exists():
             await broadcast_message({"type": "output", "data": f"❌ Script not found: {main_cmd}\n"})
             await broadcast_message({"type": "output", "data": "💡 Try pulling the latest Docker image:\n"})
-            await broadcast_message({"type": "output", "data": "   docker pull smidley/dovi-convert:latest\n"})
+            await broadcast_message({"type": "output", "data": "   docker pull ghcr.io/jhowards/dovi-convert-docker:latest\n"})
             return
         
         # Join command into a string for shell execution with proper escaping

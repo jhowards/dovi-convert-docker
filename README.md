@@ -7,6 +7,8 @@ A Docker container with a web interface for converting Dolby Vision Profile 7 MK
 
 ## Jellyfin 12 compatibility fork
 
+The fork now bundles stable **dovi_convert 8.2.0** and uses its v8 command syntax for scans, individual conversions, directory conversions, and cleanup. Scan classification reads the file's Status line, and existing full-file `.mkv.bak.dovi_convert` backups remain supported. The v8 enhancement-layer archive feature is available through the CLI; the web UI continues to use full-file backups.
+
 This fork uses Jellyfin's supported `Authorization: MediaBrowser Token="..."` header for connection tests, library discovery, scans, and metadata refresh. Jellyfin 12.1.0 rejects the legacy token headers used by the upstream image.
 
 Container image: `ghcr.io/jhowards/dovi-convert-docker:latest`. In Unraid, change the container's Repository to this image and apply, keeping the existing ports, media mounts, and /config mount. Your existing Jellyfin API key remains valid.
