@@ -3,6 +3,7 @@ DoVi Convert Web Interface
 A FastAPI application providing a web UI for the dovi_convert script.
 """
 
+from contextlib import asynccontextmanager
 import asyncio
 import os
 import json
@@ -14,7 +15,7 @@ import sys
 import aiohttp
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -22,7 +23,6 @@ from fastapi.requests import Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import subprocess
-from contextlib import asynccontextmanager
 
 # Configure logging to output to container logs (stdout)
 logging.basicConfig(
@@ -38,17 +38,20 @@ def jellyfin_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f'MediaBrowser Token="{api_key.strip()}"'}
 
 @asynccontextmanager
-async def app_lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):
     await startup_event()
     try:
         yield
     finally:
         if state.scheduled_task:
             state.scheduled_task.cancel()
-            await state.scheduled_task
+            try:
+                await state.scheduled_task
+            except asyncio.CancelledError:
+                pass
 
 
-app = FastAPI(title="DoVi Convert", version="1.2.0", lifespan=app_lifespan)
+app = FastAPI(title="DoVi Convert", version="1.2.0", lifespan=lifespan)
 
 # Mount static files and templates
 app.mount("/static", StaticFiles(directory="/app/static"), name="static")
@@ -97,10 +100,16 @@ class AppState:
         settings_file = Path(CONFIG_PATH) / "settings.json"
         if settings_file.exists():
             with open(settings_file) as f:
-                return json.load(f)
+                settings = json.load(f)
+                for key, value in {"backup_mode": "full", "output_mode": "dv", "output_dir": ""}.items():
+                    settings.setdefault(key, value)
+                return settings
         return {
             "scan_path": MEDIA_PATH,
             "auto_cleanup": False,
+            "backup_mode": "full",
+            "output_mode": "dv",
+            "output_dir": "",
             "safe_mode": False,
             "include_simple_fel": False,
             "scan_depth": 5,
@@ -169,6 +178,9 @@ state = AppState()
 
 class SettingsUpdate(BaseModel):
     scan_path: Optional[str] = None
+    backup_mode: Optional[Literal["full", "compact"]] = None
+    output_mode: Optional[Literal["dv", "hdr10"]] = None
+    output_dir: Optional[str] = None
     auto_cleanup: Optional[bool] = None
     safe_mode: Optional[bool] = None
     include_simple_fel: Optional[bool] = None
@@ -195,9 +207,7 @@ class ScanRequest(BaseModel):
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html", context={
-        "media_path": MEDIA_PATH
-    })
+    return templates.TemplateResponse(request=request, name="index.html", context={"media_path": MEDIA_PATH})
 
 
 @app.get("/api/status")
@@ -222,10 +232,13 @@ async def debug_info():
     
     # Get script info if it exists
     script_info = None
+    engine_version = None
     if dovi_convert_exists:
         try:
             result = subprocess.run(["head", "-5", dovi_convert_path], capture_output=True, text=True)
             script_info = result.stdout[:200] if result.returncode == 0 else "Could not read"
+            match = re.search(r'^VERSION\s*=\s*[\"\']([^\"\']+)', Path(dovi_convert_path).read_text(errors="replace"), re.MULTILINE)
+            engine_version = match.group(1) if match else None
         except:
             script_info = "Error reading script"
     
@@ -234,6 +247,7 @@ async def debug_info():
         "dovi_convert_exists": dovi_convert_exists,
         "dovi_convert_executable": os.access(dovi_convert_path, os.X_OK) if dovi_convert_exists else False,
         "script_preview": script_info,
+        "engine_version": engine_version,
         "dovi_tool": shutil.which("dovi_tool"),
         "ffmpeg": shutil.which("ffmpeg"),
         "mediainfo": shutil.which("mediainfo"),
@@ -256,6 +270,8 @@ async def get_settings():
 
 @app.post("/api/settings")
 async def update_settings(settings: SettingsUpdate):
+    if settings.output_dir is not None and settings.output_dir.strip() and not Path(settings.output_dir.strip()).is_absolute():
+        raise HTTPException(status_code=400, detail="Output directory must be an absolute path")
     if settings.scan_path is not None:
         if not state.settings.get("use_jellyfin") and not Path(settings.scan_path).exists():
             raise HTTPException(status_code=400, detail="Path does not exist")
@@ -290,6 +306,12 @@ async def update_settings(settings: SettingsUpdate):
     if settings.auto_convert is not None:
         state.settings["auto_convert"] = settings.auto_convert
     
+    for key in ("backup_mode", "output_mode", "output_dir"):
+        value = getattr(settings, key)
+        if value is not None:
+            state.settings[key] = value.strip() if key == "output_dir" else value
+
+    backup_stats_cache.last_update = None
     state.save_settings()
     
     # Update scheduled task if needed
@@ -299,11 +321,33 @@ async def update_settings(settings: SettingsUpdate):
     return state.settings
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+FULL_BACKUP_PATTERNS = ('.bak.dovi_convert', '.mkv.bak', '.bak', '.backup', '.original')
+
+
+def backup_files():
+    """Find backups in media and output storage without double counting."""
+    roots = [state.settings.get("scan_path", MEDIA_PATH), state.settings.get("output_dir", "")]
+    seen = set()
+    for directory in filter(None, roots):
+        for root, _, files in os.walk(directory):
+            for name in files:
+                if not name.endswith(FULL_BACKUP_PATTERNS + ('.dovi',)):
+                    continue
+                path = Path(root) / name
+                key = str(path.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    yield path
+
+
 class BackupStatsCache:
     """Cache for backup statistics to avoid repeated filesystem walks."""
     def __init__(self):
         self.count = 0
         self.size = 0
+        self.compact_count = 0
+        self.compact_size = 0
         self.last_update = None
         self.cache_ttl = 60  # Cache for 60 seconds
     
@@ -340,17 +384,20 @@ async def get_stats():
         # Count backup files (expensive operation - cache it)
         backup_count = 0
         backup_size = 0
-        try:
-            for root, _, files in os.walk(scan_path):
-                for f in files:
-                    if f.endswith(('.bak', '.backup', '.original', '.bak.dovi_convert')):
-                        backup_count += 1
-                        try:
-                            backup_size += os.path.getsize(os.path.join(root, f))
-                        except:
-                            pass
-        except:
-            pass
+        compact_count = 0
+        compact_size = 0
+        for path in backup_files():
+            try:
+                size = path.stat().st_size
+                backup_count += 1
+                backup_size += size
+                if path.suffix == '.dovi':
+                    compact_count += 1
+                    compact_size += size
+            except OSError:
+                pass
+        backup_stats_cache.compact_count = compact_count
+        backup_stats_cache.compact_size = compact_size
         backup_stats_cache.update(backup_count, backup_size)
     
     return {
@@ -360,6 +407,10 @@ async def get_stats():
         "sdr_count": sdr_count,
         "backup_count": backup_count,
         "backup_size": backup_size,
+        "compact_backup_count": backup_stats_cache.compact_count,
+        "compact_backup_size": backup_stats_cache.compact_size,
+        "full_backup_count": backup_count - backup_stats_cache.compact_count,
+        "full_backup_size": backup_size - backup_stats_cache.compact_size,
         "history": state.conversion_history[-20:],
         "last_scan": state.scan_cache.get("last_scan")
     }
@@ -458,50 +509,35 @@ async def get_cached_results():
 @app.get("/api/backups")
 async def list_backups():
     """List all backup files that can be restored."""
-    scan_path = state.settings.get("scan_path", MEDIA_PATH)
     backups = []
-    
-    # Backup file patterns from dovi_convert
-    backup_patterns = ('.bak.dovi_convert', '.mkv.bak', '.bak', '.backup', '.original')
-    
-    try:
-        for root, _, files in os.walk(scan_path):
-            for f in files:
-                if any(f.endswith(ext) for ext in backup_patterns):
-                    filepath = os.path.join(root, f)
-                    try:
-                        stat = os.stat(filepath)
-                        
-                        # Determine what the original filename would be
-                        original_name = f
-                        for ext in backup_patterns:
-                            if f.endswith(ext):
-                                original_name = f[:-len(ext)]
-                                if not original_name.endswith('.mkv'):
-                                    original_name += '.mkv'
-                                break
-                        
-                        original_path = os.path.join(root, original_name)
-                        converted_exists = os.path.exists(original_path)
-                        
-                        backups.append({
-                            "backup_path": filepath,
-                            "backup_name": f,
-                            "original_name": original_name,
-                            "original_path": original_path,
-                            "converted_exists": converted_exists,
-                            "size": stat.st_size,
-                            "modified": stat.st_mtime,
-                            "directory": root
-                        })
-                    except:
-                        pass
-    except Exception as e:
-        logger.error(f"Error listing backups: {e}")
-    
-    # Sort by modification time, newest first
-    backups.sort(key=lambda x: x.get("modified", 0), reverse=True)
-    
+    for path in backup_files():
+        try:
+            stat = path.stat()
+            compact = path.suffix == '.dovi'
+            original_name = path.name
+            if compact:
+                original_name = path.with_suffix('.mkv').name
+            else:
+                for suffix in FULL_BACKUP_PATTERNS:
+                    if original_name.endswith(suffix):
+                        original_name = original_name[:-len(suffix)]
+                        if not original_name.endswith('.mkv'):
+                            original_name += '.mkv'
+                        break
+            original_path = path.parent / original_name
+            converted_exists = original_path.is_file()
+            restored_path = original_path.with_name(original_path.stem + '.restored.mkv')
+            backups.append({
+                "backup_path": str(path), "backup_name": path.name,
+                "backup_type": "compact" if compact else "full",
+                "original_name": original_name, "original_path": str(original_path),
+                "converted_exists": converted_exists,
+                "can_restore": (converted_exists and not restored_path.exists()) if compact else True,
+                "size": stat.st_size, "modified": stat.st_mtime, "directory": str(path.parent)
+            })
+        except OSError:
+            pass
+    backups.sort(key=lambda item: item["modified"], reverse=True)
     return {"backups": backups, "total": len(backups)}
 
 
@@ -512,7 +548,13 @@ class RestoreRequest(BaseModel):
 @app.post("/api/backups/restore")
 async def restore_backup(request: RestoreRequest):
     """Restore a backup file, replacing the converted version."""
+    if state.is_running:
+        raise HTTPException(status_code=409, detail="A process is already running")
     backup_path = request.backup_path
+    if Path(backup_path).suffix == ".dovi":
+        return await restore_compact_backup(Path(backup_path))
+    if not backup_path.endswith(FULL_BACKUP_PATTERNS):
+        raise HTTPException(status_code=400, detail="Unsupported backup file")
     
     if not os.path.exists(backup_path):
         raise HTTPException(status_code=404, detail="Backup file not found")
@@ -550,8 +592,10 @@ async def restore_backup(request: RestoreRequest):
             logger.info("Jellyfin integration enabled - triggering metadata refresh after restore")
             await refresh_jellyfin_item(original_path)
         
+        backup_stats_cache.last_update = None
         return {
             "success": True,
+            "restored_path": original_path,
             "restored": original_name,
             "backup_removed": backup_path
         }
@@ -563,6 +607,10 @@ async def restore_backup(request: RestoreRequest):
 @app.post("/api/backups/delete")
 async def delete_single_backup(request: RestoreRequest):
     """Delete a single backup file."""
+    if state.is_running:
+        raise HTTPException(status_code=409, detail="A process is already running")
+    if not request.backup_path.endswith(FULL_BACKUP_PATTERNS + (".dovi",)):
+        raise HTTPException(status_code=400, detail="Unsupported backup file")
     backup_path = request.backup_path
     
     if not os.path.exists(backup_path):
@@ -572,6 +620,7 @@ async def delete_single_backup(request: RestoreRequest):
         size = os.path.getsize(backup_path)
         os.remove(backup_path)
         logger.info(f"Deleted backup: {backup_path}")
+        backup_stats_cache.last_update = None
         return {"success": True, "freed": size}
     except Exception as e:
         logger.error(f"Error deleting backup: {e}")
@@ -580,28 +629,21 @@ async def delete_single_backup(request: RestoreRequest):
 
 @app.post("/api/backups/clean")
 async def clean_backups():
-    """Delete all backup files."""
-    scan_path = state.settings.get("scan_path", MEDIA_PATH)
-    deleted = 0
-    freed = 0
-    backup_patterns = ('.bak.dovi_convert', '.mkv.bak', '.bak', '.backup', '.original')
-    
-    try:
-        for root, _, files in os.walk(scan_path):
-            for f in files:
-                if any(f.endswith(ext) for ext in backup_patterns):
-                    filepath = os.path.join(root, f)
-                    try:
-                        size = os.path.getsize(filepath)
-                        os.remove(filepath)
-                        deleted += 1
-                        freed += size
-                        logger.info(f"Deleted backup: {filepath}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {filepath}: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+    """Delete full backups only; preserve compact restoration archives."""
+    if state.is_running:
+        raise HTTPException(status_code=409, detail="A process is already running")
+    deleted = freed = 0
+    for path in backup_files():
+        if path.suffix == '.dovi':
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            deleted += 1
+            freed += size
+        except OSError as exc:
+            logger.warning(f"Failed to delete {path}: {exc}")
+    backup_stats_cache.last_update = None
     return {"deleted": deleted, "freed": freed}
 
 
@@ -721,11 +763,98 @@ async def test_jellyfin():
         raise HTTPException(status_code=500, detail=f"Connection error: {str(e)}")
 
 
+class InspectRequest(BaseModel):
+    filepath: str
+
+
+async def run_engine_report(cmd: list, action: str, cwd: str):
+    """Stream a cancellable engine operation while retaining its complete report."""
+    state.is_running = True
+    state.scan_cancelled = False
+    state.current_action = action
+    output = []
+    try:
+        await broadcast_message({"type": "status", "running": True, "action": action})
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL, cwd=cwd, env=env
+        )
+        state.current_process = process
+        buffer = ""
+        while True:
+            chunk = await process.stdout.read(4096)
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", errors="replace")
+            buffer = buffer.replace("\r\n", "\n").replace("\r", "\n")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = ANSI_ESCAPE_RE.sub("", line) + "\n"
+                output.append(line)
+                await broadcast_message({"type": "output", "data": line})
+        if buffer:
+            output.append(ANSI_ESCAPE_RE.sub("", buffer))
+            await broadcast_message({"type": "output", "data": output[-1]})
+        await process.wait()
+        report = "".join(output)
+        success = process.returncode == 0 and not state.scan_cancelled and not re.search(r"Error:|FAILED|FAIL:|Failed to", report, re.IGNORECASE)
+        return {"success": success, "output": report}
+    except Exception as exc:
+        return {"success": False, "output": "".join(output) + f"\n{exc}"}
+    finally:
+        state.is_running = False
+        state.current_action = None
+        state.current_process = None
+        await broadcast_message({"type": "status", "running": False})
+
+
+@app.post("/api/inspect")
+async def inspect_file(request: InspectRequest):
+    if state.is_running:
+        raise HTTPException(status_code=409, detail="A process is already running")
+    path = Path(request.filepath).resolve()
+    if not path.is_file() or path.suffix.lower() != '.mkv':
+        raise HTTPException(status_code=400, detail="An existing MKV file is required")
+    cmd = ["/usr/local/bin/dovi_convert", "inspect", str(path)]
+    if state.settings.get("safe_mode"):
+        cmd.append("--safe")
+    return await run_engine_report(cmd, "inspect", str(path.parent))
+
+
+async def restore_compact_backup(archive: Path):
+    archive = archive.resolve()
+    if not archive.is_file():
+        raise HTTPException(status_code=404, detail="Backup file not found")
+    source = archive.with_suffix('.mkv')
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail="Compact restore requires its companion converted MKV")
+    restored = source.with_name(source.stem + '.restored.mkv')
+    if restored.exists():
+        raise HTTPException(status_code=409, detail="Restored file already exists")
+    cmd = ["/usr/local/bin/dovi_convert", "restore", str(source), "--source", str(archive)]
+    if state.settings.get("use_temp_storage") and os.path.ismount('/temp_storage'):
+        cmd.extend(["--temp", "/temp_storage"])
+    result = await run_engine_report(cmd, "restore", str(source.parent))
+    result["success"] = result["success"] and restored.is_file() and restored.stat().st_size > 0
+    if result["success"]:
+        stat = restored.stat()
+        state.scan_cache.setdefault("files", {})[str(restored)] = {"profile": "profile7", "fel_type": "unknown", "mtime": stat.st_mtime, "size": stat.st_size}
+        state.save_scan_cache()
+        if state.settings.get("use_jellyfin"):
+            await refresh_jellyfin_item(str(restored), new_file=True)
+        result.update({"restored": restored.name, "restored_path": str(restored)})
+    return result
+
+
 @app.post("/api/scan")
 async def start_scan(request: ScanRequest = ScanRequest()):
     if state.is_running:
         raise HTTPException(status_code=409, detail="A process is already running")
     
+    state.is_running = True
+    state.scan_cancelled = False
     state.current_action = "scan"
     await broadcast_message({"type": "status", "running": True, "action": "scan"})
     
@@ -735,6 +864,8 @@ async def start_scan(request: ScanRequest = ScanRequest()):
         
         if not jellyfin_url or not jellyfin_key:
             await broadcast_message({"type": "output", "data": "❌ Jellyfin URL and API key are required\n"})
+            state.is_running = False
+            state.current_action = None
             await broadcast_message({"type": "status", "running": False})
             return {"status": "error", "message": "Jellyfin not configured"}
         
@@ -750,6 +881,8 @@ async def start_convert(request: ConvertRequest = ConvertRequest()):
     if state.is_running:
         raise HTTPException(status_code=409, detail="A process is already running")
     
+    state.is_running = True
+    state.scan_cancelled = False
     state.current_action = "convert"
     await broadcast_message({"type": "status", "running": True, "action": "convert"})
     asyncio.create_task(run_convert(files=request.files))
@@ -848,7 +981,7 @@ async def broadcast_message(message: dict):
             logger.info(f"Removed disconnected client. Remaining: {len(state.websocket_clients)}")
 
 
-async def refresh_jellyfin_item(filepath: str):
+async def refresh_jellyfin_item(filepath: str, new_file: bool = False):
     """Refresh Jellyfin metadata for a converted file."""
     logger.info(f"Attempting Jellyfin refresh for: {filepath}")
     
@@ -868,6 +1001,11 @@ async def refresh_jellyfin_item(filepath: str):
         headers = jellyfin_headers(api_key)
         
         async with aiohttp.ClientSession() as session:
+            if new_file:
+                # An external/restored output needs discovery, not refresh of an old same-name item.
+                async with session.post(f"{url}/Library/Refresh", headers=headers) as response:
+                    await broadcast_message({"type": "output", "data": f"Jellyfin library scan requested for {filepath}: {response.status}\n"})
+                return
             # Search for the item by filename
             search_url = f"{url}/Items"
             params = {
@@ -1955,59 +2093,34 @@ async def run_convert(files: List[str] = None):
     """Run conversion on selected files or batch."""
     logger.info(f"Starting conversion - files: {len(files) if files else 'batch'}")
     state.is_running = True
-    scan_path = state.settings.get("scan_path", MEDIA_PATH)
-    safe_mode = state.settings.get("safe_mode", False)
-    include_simple = state.settings.get("include_simple_fel", False)
+    conversion_settings = state.settings.copy()
+    scan_path = conversion_settings.get("scan_path", MEDIA_PATH)
+    safe_mode = conversion_settings.get("safe_mode", False)
+    include_simple = conversion_settings.get("include_simple_fel", False)
     
-    # Fixed temp storage path - must be mounted by user in Docker/Unraid
+    state.scan_cancelled = False
+    state.current_action = "convert"
     TEMP_STORAGE_PATH = "/temp_storage"
-    use_temp_storage_setting = state.settings.get("use_temp_storage", False)
+    use_temp_storage_setting = conversion_settings.get("use_temp_storage", False)
     temp_storage_available = os.path.isdir(TEMP_STORAGE_PATH) and os.path.ismount(TEMP_STORAGE_PATH)
-    use_temp_storage = use_temp_storage_setting and temp_storage_available and safe_mode
+    use_temp_storage = use_temp_storage_setting and temp_storage_available
     temp_path = TEMP_STORAGE_PATH if use_temp_storage else ""
-    
-    logger.info(f"Conversion settings - safe_mode: {safe_mode}, include_simple: {include_simple}, use_temp_storage: {use_temp_storage_setting}, temp_available: {temp_storage_available}")
-    
-    # Check disk space before starting
-    if files:
-        largest_file_size = 0
-        for filepath in files:
-            try:
-                size = Path(filepath).stat().st_size if Path(filepath).exists() else 0
-                largest_file_size = max(largest_file_size, size)
-            except:
-                pass
-        
-        # Need at least 2x largest file size (for temp files during conversion)
-        required_space = largest_file_size * 2
-        required_space_gb = required_space / (1024**3)
-        
-        # Check temp storage space if using it
-        if use_temp_storage:
-            temp_space = get_disk_space(TEMP_STORAGE_PATH)
-            if temp_space and temp_space["free"] < required_space:
-                await broadcast_message({"type": "output", "data": f"❌ Insufficient space in temp storage!\n"})
-                await broadcast_message({"type": "output", "data": f"   Required: ~{required_space_gb:.1f} GB, Available: {temp_space['free_gb']:.1f} GB\n"})
-                await broadcast_message({"type": "output", "data": f"   Free up space or disable temp storage.\n"})
-                state.is_running = False
-                state.current_action = None
-                await broadcast_message({"type": "status", "running": False})
-                await broadcast_message({"type": "progress", "data": {"status": "failed"}})
-                return
-            elif temp_space:
-                await broadcast_message({"type": "output", "data": f"💾 Temp storage: {temp_space['free_gb']:.1f} GB free\n"})
-        
-        # Check destination space
-        dest_space = get_disk_space(scan_path)
-        if dest_space and dest_space["free"] < required_space:
-            await broadcast_message({"type": "output", "data": f"⚠️ Low disk space warning!\n"})
-            await broadcast_message({"type": "output", "data": f"   Required: ~{required_space_gb:.1f} GB, Available: {dest_space['free_gb']:.1f} GB\n"})
-            await broadcast_message({"type": "output", "data": f"   Conversion may fail if space runs out.\n\n"})
-    
+    output_dir = conversion_settings.get("output_dir", "").strip()
     conversion_results = []  # Track success/failure for each file
     final_status = "complete"  # Track overall status for progress bar
     
     try:
+        batch = not files
+        if batch:
+            # Keep recursive batch scope; upstream validates each file's FEL eligibility.
+            files = []
+            base = Path(scan_path).resolve()
+            depth = conversion_settings.get("scan_depth", 5)
+            for root, dirs, names in os.walk(base):
+                if len(Path(root).relative_to(base).parts) >= (0 if depth == 1 else depth):
+                    dirs[:] = []
+                files.extend(str(Path(root) / name) for name in sorted(names) if name.endswith('.mkv') and not name.startswith('._') and '._' not in str(Path(root) / name))
+
         # Warn if temp storage is enabled but not available
         if use_temp_storage_setting and not temp_storage_available:
             await broadcast_message({"type": "output", "data": f"⚠️ Temp storage enabled but /temp_storage is not mounted!\n"})
@@ -2182,142 +2295,80 @@ async def run_convert(files: List[str] = None):
                     await broadcast_message({"type": "output", "data": f"💾 Temp storage: {temp_path}\n"})
                 await broadcast_message({"type": "output", "data": f"{'='*60}\n"})
                 
-                # Variables for temp storage workflow
-                convert_filepath = actual_filepath
-                temp_file = None
-                
-                # If using temp storage, copy file there first
-                if use_temp_storage:
-                    temp_file = os.path.join(temp_path, filename)
-                    
-                    copy_success = await copy_file_with_progress(
-                        actual_filepath, temp_file, i, total, filename, "Copying to temp storage"
-                    )
-                    
-                    if not copy_success:
-                        conversion_results.append({"file": filename, "status": "failed"})
-                        state.add_to_history(filename, "failed", log_id)
-                        continue
-                    
-                    convert_filepath = temp_file
-                    await broadcast_message({"type": "output", "data": f"✅ Copied to temp storage\n\n"})
-                
-                cmd = ["/usr/local/bin/dovi_convert", "convert", convert_filepath]
-                if safe_mode:
-                    cmd.append("--safe")
-                if include_simple:
-                    cmd.append("--include-simple")
-                cmd.append("--yes")
-                
-                # Run command and track result
-                success = await run_convert_command(cmd, cwd=str(Path(convert_filepath).parent), 
-                                                    file_num=i, total_files=total, filename=filename,
-                                                    file_size=file_size, filepath=actual_filepath)
-                
-                if success:
-                    # Verify conversion by checking for backup file
-                    backup_path = convert_filepath + ".bak.dovi_convert"
-                    backup_exists = Path(backup_path).exists()
-                    
-                    if backup_exists:
-                        logger.info(f"Backup file verified: {backup_path}")
-                        
-                        # If using temp storage, move converted file back
-                        if use_temp_storage and temp_file:
-                            await broadcast_message({"type": "output", "data": f"\n📋 Moving converted file back to original location...\n"})
-                            
-                            # Move the converted file back to original location
-                            move_success = await move_file_with_progress(
-                                convert_filepath, actual_filepath, i, total, filename
-                            )
-                            
-                            if not move_success:
-                                logger.error("Failed to move converted file back")
-                                conversion_results.append({"file": filename, "status": "failed"})
-                                state.add_to_history(filename, "failed", log_id)
-                                await broadcast_message({"type": "output", "data": f"❌ Failed to move file back to original location\n"})
-                                # Clean up temp backup
-                                if Path(backup_path).exists():
-                                    Path(backup_path).unlink()
-                                continue
-                            
-                            # Move backup from temp to original location
-                            original_backup_path = actual_filepath + ".bak.dovi_convert"
-                            try:
-                                if Path(backup_path).exists():
-                                    # Try rename first (same filesystem)
-                                    try:
-                                        os.rename(backup_path, original_backup_path)
-                                    except OSError:
-                                        # Cross-filesystem copy
-                                        import shutil
-                                        shutil.move(backup_path, original_backup_path)
-                                    await broadcast_message({"type": "output", "data": f"📦 Backup moved to original location\n"})
-                            except Exception as e:
-                                logger.warning(f"Could not move backup: {e}")
-                            
-                            backup_path = original_backup_path
-                        
-                        conversion_results.append({"file": filename, "status": "success"})
-                        state.add_to_history(filename, "success", log_id)
-                        await broadcast_message({"type": "output", "data": f"\n✅ {filename} - CONVERTED SUCCESSFULLY\n"})
-                        await broadcast_message({"type": "output", "data": f"📦 Backup created: {Path(backup_path).name}\n"})
-                        
-                        # Update cache - file was converted (update both original and actual path)
-                        if filepath in state.scan_cache.get("files", {}):
-                            state.scan_cache["files"][filepath]["profile"] = "profile8"
-                        if actual_filepath != filepath and actual_filepath in state.scan_cache.get("files", {}):
-                            state.scan_cache["files"][actual_filepath]["profile"] = "profile8"
-                        state.save_scan_cache()
-                        
-                        # Refresh Jellyfin metadata if Jellyfin integration is enabled
-                        if state.settings.get("use_jellyfin"):
-                            logger.info("Jellyfin integration enabled - triggering refresh")
-                            await refresh_jellyfin_item(actual_filepath)
-                        else:
-                            logger.info("Jellyfin integration not enabled - skipping refresh")
-                    else:
-                        # Command reported success but no backup = didn't actually convert
-                        logger.warning(f"No backup file found at {backup_path} - conversion may not have occurred")
-                        success = False
-                        conversion_results.append({"file": filename, "status": "failed"})
-                        state.add_to_history(filename, "failed", log_id)
-                        await broadcast_message({"type": "output", "data": f"\n⚠️ {filename} - NO BACKUP FILE CREATED\n"})
-                        await broadcast_message({"type": "output", "data": f"💡 dovi_convert may have skipped this file (not Profile 7?) or failed silently\n"})
-                        
-                        # Clean up temp file if used
-                        if use_temp_storage and temp_file and Path(temp_file).exists():
-                            Path(temp_file).unlink()
-                
-                if not success:
-                    conversion_results.append({"file": filename, "status": "failed"})
-                    state.add_to_history(filename, "failed", log_id)
-                    await broadcast_message({"type": "output", "data": f"\n❌ {filename} - CONVERSION FAILED\n"})
-                    
-                    # Clean up temp files if used
-                    if use_temp_storage and temp_file:
-                        for temp_cleanup in [temp_file, temp_file + ".bak.dovi_convert"]:
-                            if Path(temp_cleanup).exists():
-                                try:
-                                    Path(temp_cleanup).unlink()
-                                    logger.debug(f"Cleaned up temp file: {temp_cleanup}")
-                                except Exception as e:
-                                    logger.warning(f"Could not clean up {temp_cleanup}: {e}")
-            
+                source = Path(actual_filepath).resolve()
+                destination_dir = Path(output_dir) if output_dir else source.parent
+                if output_dir and batch:
+                    # Match directory conversion's preserved source directory structure.
+                    destination_dir = destination_dir / Path(scan_path).resolve().name / source.parent.relative_to(Path(scan_path).resolve())
+                output_path = destination_dir / (source.stem + '.mkv')
+                compact_path = destination_dir / (source.stem + '.dovi')
+                if output_path != source and output_path.exists():
+                    await broadcast_message({"type": "output", "data": f"Skipping: output already exists: {output_path}\n"})
+                    result = "skipped"
+                else:
+                    cmd = ["/usr/local/bin/dovi_convert", "convert", str(source), "--yes", "--verbose"]
+                    if safe_mode:
+                        cmd.append("--safe")
+                    if include_simple:
+                        cmd.append("--include-simple")
+                    if use_temp_storage:
+                        cmd.extend(["--temp", temp_path])
+                    if output_dir:
+                        cmd.extend(["--output", str(destination_dir)])
+                    if conversion_settings.get("backup_mode", "full") == "compact":
+                        cmd.append("--backup")
+                    if conversion_settings.get("output_mode", "dv") == "hdr10":
+                        cmd.append("--hdr10")
+                    if conversion_settings.get("auto_cleanup", False):
+                        # Upstream removes only this original after verified placement.
+                        cmd.append("--delete")
+                    success = await run_convert_command(cmd, cwd=str(source.parent),
+                        file_num=i, total_files=total, filename=filename,
+                        file_size=file_size, filepath=str(source))
+                    result = "success" if success else state.last_conversion_status
+                    if success:
+                        success = output_path.is_file() and output_path.stat().st_size > 0
+                        if conversion_settings.get("backup_mode", "full") == "compact":
+                            success = success and compact_path.is_file() and compact_path.stat().st_size > 0
+                        result = "success" if success else "failed"
+                conversion_results.append({"file": filename, "status": result, "output_path": str(output_path)})
+                state.add_to_history(filename, result, log_id)
+                if result == "success":
+                    profile = "hdr10" if conversion_settings.get("output_mode", "dv") == "hdr10" else "profile8"
+                    cache = state.scan_cache.setdefault("files", {})
+                    previous = cache.pop(filepath, {})
+                    if actual_filepath != filepath:
+                        previous = cache.pop(actual_filepath, previous)
+                    stat = output_path.stat()
+                    previous.update({"profile": profile, "mtime": stat.st_mtime, "size": stat.st_size, "fel_type": None})
+                    cache[str(output_path)] = previous
+                    state.save_scan_cache()
+                    backup_stats_cache.last_update = None
+                    await broadcast_message({"type": "output", "data": f"\nConverted: {output_path}\n"})
+                    if conversion_settings.get("use_jellyfin"):
+                        await refresh_jellyfin_item(str(output_path), new_file=output_path != source)
+                else:
+                    await broadcast_message({"type": "output", "data": f"\n{filename}: {result}\n"})
+                if state.scan_cancelled:
+                    final_status = "cancelled"
+                    break
+
             # Final summary
             successful = sum(1 for r in conversion_results if r["status"] == "success")
             failed = sum(1 for r in conversion_results if r["status"] == "failed")
+            skipped = sum(1 for r in conversion_results if r["status"] == "skipped")
             
             await broadcast_message({"type": "output", "data": f"\n{'='*60}\n"})
             await broadcast_message({"type": "output", "data": f"📊 CONVERSION SUMMARY\n"})
             await broadcast_message({"type": "output", "data": f"{'='*60}\n"})
             await broadcast_message({"type": "output", "data": f"✅ Successful: {successful}\n"})
             await broadcast_message({"type": "output", "data": f"❌ Failed: {failed}\n"})
+            await broadcast_message({"type": "output", "data": f"Skipped: {skipped}\n"})
             await broadcast_message({"type": "output", "data": f"{'='*60}\n"})
             
             await broadcast_message({
                 "type": "conversion_complete", 
-                "data": {"successful": successful, "failed": failed, "results": conversion_results}
+                "data": {"successful": successful, "failed": failed, "skipped": skipped, "results": conversion_results}
             })
             
             # Set final status based on results
@@ -2326,30 +2377,17 @@ async def run_convert(files: List[str] = None):
             elif failed > 0:
                 final_status = "partial"  # Some succeeded, some failed
         else:
-            # Batch conversion
-            await broadcast_message({"type": "output", "data": f"🎬 Starting batch conversion in: {scan_path}\n"})
-            
-            cmd = ["/usr/local/bin/dovi_convert", "convert", ".", "--recursive", str(state.settings.get("scan_depth", 5)), "--yes"]
-            if safe_mode:
-                cmd.append("--safe")
-            if include_simple:
-                cmd.append("--include-simple")
-            
-            await broadcast_message({"type": "output", "data": f"Running: {' '.join(cmd)}\n\n"})
-            await run_command(cmd, cwd=scan_path)
-        
-        # Auto cleanup if enabled
-        if state.settings.get("auto_cleanup", False):
-            await broadcast_message({"type": "output", "data": "\n🧹 Running cleanup...\n"})
-            cleanup_cmd = ["/usr/local/bin/dovi_convert", "cleanup", "--recursive", "--yes"]
-            await run_command(cleanup_cmd, cwd=scan_path)
-            
+            await broadcast_message({"type": "output", "data": "No MKV files found for conversion.\n"})
+        if state.scan_cancelled:
+            final_status = "cancelled"
+
     except Exception as e:
         await broadcast_message({"type": "output", "data": f"\n❌ Error: {str(e)}\n"})
         final_status = "failed"
     finally:
         state.is_running = False
         state.current_action = None
+        state.current_process = None
         await broadcast_message({"type": "status", "running": False})
         await broadcast_message({"type": "progress", "data": {"status": final_status}})
 
@@ -2403,6 +2441,7 @@ async def run_command(cmd: list, cwd: str = None):
 
 async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, total_files: int = 1, filename: str = "", file_size: int = 0, filepath: str = ""):
     """Run a conversion command with progress parsing."""
+    state.last_conversion_status = "failed"
     import re
     
     logger.info(f"Running conversion [{file_num}/{total_files}]: {filename} ({file_size / 1024**3:.1f} GB)" if file_size else f"Running conversion [{file_num}/{total_files}]: {filename}")
@@ -2419,31 +2458,15 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         cmd_str = " ".join(shlex.quote(c) for c in cmd)
         logger.info(f"Command: {cmd_str}")
         
-        # Pipe 'y' to handle Simple FEL confirmation prompt (script bug: -y doesn't auto-confirm this)
-        # Multiple 'y' answers in case there are multiple prompts
-        full_cmd = f"echo 'y\ny\ny' | {cmd_str}"
-        
-        # Set up environment with temp storage path if configured and available
         env = os.environ.copy()
-        TEMP_STORAGE_PATH = "/temp_storage"
-        use_temp = state.settings.get("use_temp_storage", False)
-        if use_temp and os.path.isdir(TEMP_STORAGE_PATH) and os.path.ismount(TEMP_STORAGE_PATH):
-            temp_path = TEMP_STORAGE_PATH
-            env["TMPDIR"] = temp_path
-            env["TEMP"] = temp_path
-            env["TMP"] = temp_path
-            await broadcast_message({"type": "output", "data": f"📁 Using temp storage: {temp_path}\n"})
-        
-        await broadcast_message({"type": "output", "data": f"🔧 Running: {cmd_str}\n\n"})
-        
-        process = await asyncio.create_subprocess_shell(
-            full_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd,
-            env=env
+        env["PYTHONUNBUFFERED"] = "1"
+        await broadcast_message({"type": "output", "data": f"Running: {cmd_str}\n\n"})
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL,
+            cwd=cwd, env=env
         )
-        
+
         state.current_process = process
         current_step = "Initializing"
         file_percent = 0
@@ -2454,7 +2477,7 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         step_patterns = [
             (r"Extracting|Extract", "Extracting video stream"),
             (r"Analyzing|Analyz", "Analyzing Dolby Vision"),
-            (r"Converting|Convert", "Converting to Profile 8"),
+            (r"Converting|Convert", "Converting to HDR10" if state.settings.get("output_mode") == "hdr10" else "Converting to Profile 8.1"),
             (r"Remux|Muxing|mux", "Remuxing to MKV"),
             (r"Cleanup|Clean", "Cleaning up temp files"),
             (r"Verif", "Verifying output"),
@@ -2467,6 +2490,7 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         output_lines = []
         saw_error = False
         saw_success = False
+        saw_skip = False
         buffer = ""
         last_progress_update = 0
         
@@ -2485,18 +2509,22 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         
         async def process_line(text):
             """Process a single line of output"""
-            nonlocal saw_error, saw_success, current_step, file_percent, last_progress_update, current_step_num, total_steps, script_elapsed_secs
+            nonlocal saw_error, saw_success, saw_skip, current_step, file_percent, last_progress_update, current_step_num, total_steps, script_elapsed_secs
             
+            text = ANSI_ESCAPE_RE.sub("", text)
             output_lines.append(text)
             await broadcast_message({"type": "output", "data": text})
             
             # Check for error indicators in output
-            if re.search(r'Unknown command|Error:|ERROR|FAILED|failed|No such file|not found', text, re.IGNORECASE):
+            if re.search(r'Unknown command|Error:|ERROR|FAIL:|FAILED|failed|No such file|not found', text, re.IGNORECASE):
                 if not re.search(r'Command not found', text):  # Ignore our own messages
                     saw_error = True
             
             # Check for success indicators
-            if re.search(r'successfully|completed|done|finished|✓|SUCCESS', text, re.IGNORECASE):
+            if re.search(r'Skipping|not a Dolby Vision Profile 7', text, re.IGNORECASE):
+                saw_skip = True
+            # Verification occurs before final file placement; only finalization proves conversion.
+            if re.search(r'Original Source (saved as:|deleted \(\-\-delete active\))', text):
                 saw_success = True
             
             # Parse elapsed time from script output like "(1m 44s)" or "(5s)"
@@ -2655,7 +2683,8 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
         
         # Determine success based on exit code AND output content
         # Empty output is suspicious - script should produce SOMETHING
-        if process.returncode == 0 and not saw_error and not is_just_usage and not is_empty_output:
+        if process.returncode == 0 and saw_success and not saw_error and not state.scan_cancelled and not is_just_usage and not is_empty_output:
+            state.last_conversion_status = "success"
             logger.info(f"Conversion SUCCESS: {filename}")
             await broadcast_message({
                 "type": "progress",
@@ -2672,6 +2701,7 @@ async def run_convert_command(cmd: list, cwd: str = None, file_num: int = 1, tot
             })
             return True
         else:
+            state.last_conversion_status = "cancelled" if state.scan_cancelled else ("skipped" if saw_skip else "failed")
             logger.warning(f"Conversion FAILED: {filename} - exit_code={process.returncode}, saw_error={saw_error}, is_just_usage={is_just_usage}, is_empty={is_empty_output}")
             if is_empty_output:
                 logger.warning("Script produced no output - command may not have executed properly")
@@ -2781,8 +2811,7 @@ async def startup_event():
     logger.info(f"Conversion history: {len(state.conversion_history)} entries")
     logger.info("="*50)
     
-    # Clean up any orphaned temp files from previous runs
-    cleanup_temp_storage()
+    # Native engine owns scratch cleanup and interruption recovery.
     
     if state.settings.get("schedule_enabled"):
         logger.info("Scheduled scans enabled - starting scheduler")
